@@ -55,6 +55,7 @@ public class SchemaDiffService {
     public static class DiffResult {
         final List<String> missingSchemas = new ArrayList<>();
         final List<String[]> missingTables = new ArrayList<>();       // [schema, table]
+        final Map<String, List<String>> columnTypeChanges = new LinkedHashMap<>();
         final List<Object[]> missingColumns = new ArrayList<>();      // [schema, table, column, ColumnInfo]
     }
 
@@ -111,8 +112,12 @@ public class SchemaDiffService {
                 "SELECT table_schema, table_name, column_name, data_type, udt_name, "
                         + "character_maximum_length, numeric_precision, numeric_scale, is_nullable, column_default, "
                         + "identity_generation, identity_start, identity_minimum, identity_maximum, "
-                        + "identity_increment, identity_cycle, seqstart, seqmin, seqmax, seqincrement, seqcache, seqcycle "
+                        + "identity_increment, identity_cycle, seqstart, seqmin, seqmax, seqincrement, seqcache, seqcycle, "
+                        + "pg_catalog.format_type(attr.atttypid, attr.atttypmod) AS type_declaration "
                         + "FROM information_schema.columns "
+                        + "JOIN pg_catalog.pg_namespace ns ON ns.nspname = table_schema "
+                        + "JOIN pg_catalog.pg_class tbl ON tbl.relnamespace = ns.oid AND tbl.relname = table_name "
+                        + "JOIN pg_catalog.pg_attribute attr ON attr.attrelid = tbl.oid AND attr.attnum = ordinal_position "
                         + "LEFT JOIN pg_catalog.pg_sequence ON seqrelid = CASE WHEN is_identity = 'YES' "
                         + "THEN pg_get_serial_sequence(format('%I.%I', table_schema, table_name), column_name)::regclass END "
                         + "WHERE table_schema NOT IN ('pg_catalog', 'information_schema') "
@@ -141,6 +146,7 @@ public class SchemaDiffService {
                         String isNullable = rs.getString("is_nullable");
 
                         ColumnInfo info = new ColumnInfo(dataType, udtName, charLen, numPrecision, numScale, isNullable);
+                        info.setTypeDeclaration(rs.getString("type_declaration"));
                         info.setDefaultExpression(rs.getString("column_default"));
                         String identityGeneration = rs.getString("identity_generation");
                         if (identityGeneration != null) {
@@ -471,6 +477,12 @@ public class SchemaDiffService {
     public DiffResult diff(Map<String, Map<String, Map<String, ColumnInfo>>> aData,
                             Map<String, Map<String, Map<String, ColumnInfo>>> bData,
                             Consumer<String> logger) {
+        return diff(aData, bData, false, logger);
+    }
+
+    public DiffResult diff(Map<String, Map<String, Map<String, ColumnInfo>>> aData,
+                            Map<String, Map<String, Map<String, ColumnInfo>>> bData,
+                            boolean compareTypes, Consumer<String> logger) {
         DiffResult result = new DiffResult();
 
         for (Map.Entry<String, Map<String, Map<String, ColumnInfo>>> schemaEntry : aData.entrySet()) {
@@ -494,6 +506,18 @@ public class SchemaDiffService {
                     String column = columnEntry.getKey();
                     if (!bColumns.containsKey(column)) {
                         result.missingColumns.add(new Object[]{schema, table, column, columnEntry.getValue()});
+                    } else if (compareTypes) {
+                        String aType = columnEntry.getValue().getTypeDeclaration();
+                        String bType = bColumns.get(column).getTypeDeclaration();
+                        if (!java.util.Objects.equals(aType, bType)) {
+                            String change = quoteIdent(schema) + "." + quoteIdent(table) + "." + quoteIdent(column)
+                                    + "  A: " + aType + "  B: " + bType;
+                            change = change.replace('\r', ' ').replace('\n', ' ');
+                            result.columnTypeChanges.computeIfAbsent(schema, k -> new ArrayList<>()).add(change);
+                            if (logger != null) {
+                                logger.accept("[字段类型或长度差异] " + change);
+                            }
+                        }
                     }
                 }
             }
@@ -536,7 +560,8 @@ public class SchemaDiffService {
                 List<String> missingTables = tablesMissingBySchema.getOrDefault(schema, List.of());
                 List<Object[]> missingColumns = columnsMissingBySchema.getOrDefault(schema, List.of());
 
-                boolean hasDiff = schemaMissing || !missingTables.isEmpty() || !missingColumns.isEmpty();
+                List<String> typeChanges = diffResult.columnTypeChanges.getOrDefault(schema, List.of());
+                boolean hasDiff = schemaMissing || !missingTables.isEmpty() || !missingColumns.isEmpty() || !typeChanges.isEmpty();
                 if (!hasDiff) {
                     if (logger != null) {
                         logger.accept("[跳过] " + schema + " 无差异");
@@ -548,6 +573,10 @@ public class SchemaDiffService {
                 Map<String, String> schemaTableComments = tableComments.getOrDefault(schema, Map.of());
                 String content = buildSchemaReport(schema, schemaMissing, missingTables, missingColumns,
                         schemaTables, schemaTableComments, extrasConn, logger);
+                if (!typeChanges.isEmpty()) {
+                    content += "\n-- 以下同名字段的类型或长度不同，请审核后手工调整。\n-- "
+                            + String.join("\n-- ", typeChanges) + "\n";
+                }
                 Path path = Paths.get(outputDir, schema + ".sql");
                 try (Writer writer = Files.newBufferedWriter(path, StandardCharsets.UTF_8)) {
                     writer.write(content);

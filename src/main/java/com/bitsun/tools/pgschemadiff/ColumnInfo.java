@@ -13,6 +13,7 @@ public class ColumnInfo {
     private String comment;
     private String identityClause;
     private String defaultExpression;
+    private String typeDeclaration;
 
     public ColumnInfo(String dataType, String udtName, Integer charLen,
                        Integer numPrecision, Integer numScale, String isNullable) {
@@ -30,6 +31,14 @@ public class ColumnInfo {
 
     public void setIdentityClause(String identityClause) {
         this.identityClause = identityClause;
+    }
+
+    public String getTypeDeclaration() {
+        return typeDeclaration;
+    }
+
+    public void setTypeDeclaration(String typeDeclaration) {
+        this.typeDeclaration = typeDeclaration;
     }
 
     public String getDefaultExpression() {

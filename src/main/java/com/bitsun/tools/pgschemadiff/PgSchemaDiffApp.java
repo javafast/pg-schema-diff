@@ -65,6 +65,7 @@ public class PgSchemaDiffApp extends JFrame {
     private final JCheckBox bSslCheckBox = new JCheckBox("SSL（目标库要求 SSL 才勾选）", false);
 
     private final JTextField schemaNamesField = new JTextField(30);
+    private final JCheckBox compareColumnTypes = new JCheckBox("比对字段类型和长度");
     private final JTextField outputDirField = new JTextField("diff_reports", 30);
 
     private final JTextArea logArea = new JTextArea();
@@ -277,6 +278,8 @@ public class PgSchemaDiffApp extends JFrame {
         panel.add(new JLabel("输出目录"), labelGbc);
         panel.add(outputDirField, fieldGbc);
         panel.add(browseButton, browseGbc);
+        fieldGbc.gridy = 2;
+        panel.add(compareColumnTypes, fieldGbc);
         return panel;
     }
 
@@ -356,6 +359,7 @@ public class PgSchemaDiffApp extends JFrame {
                 .filter(s -> !s.isEmpty())
                 .collect(Collectors.toList());
         String outputDir = outputDirField.getText().trim();
+        boolean compareTypes = compareColumnTypes.isSelected();
 
         SwingWorker<Void, String> worker = new SwingWorker<Void, String>() {
             @Override
@@ -373,7 +377,7 @@ public class PgSchemaDiffApp extends JFrame {
                     Map<String, Map<String, Map<String, ColumnInfo>>> bData =
                             service.fetchColumns(bConfig, schemaNames, this::publish);
 
-                    SchemaDiffService.DiffResult diffResult = service.diff(aData, bData, this::publish);
+                    SchemaDiffService.DiffResult diffResult = service.diff(aData, bData, compareTypes, this::publish);
                     int generated = service.generateReports(aConfig, aData, diffResult, tableComments, outputDir, this::publish);
 
                     publish("共比对 " + aData.size() + " 个实例，生成 " + generated + " 份差异文档到 " + outputDir + "/");
