@@ -61,6 +61,7 @@ public class SchemaDiffService {
     /** 序列的完整定义，来自 pg_sequences，用于给新表里的 serial/identity 字段原样重建序列 */
     public static class SequenceDef {
         String qualifiedName;
+        boolean ownedByColumn;
         long startValue;
         long minValue;
         long maxValue;
@@ -311,35 +312,41 @@ public class SchemaDiffService {
             }
         }
 
-        // serial/bigserial 字段背后的序列：优先用 pg_get_serial_sequence，但它只认
-        // 与列关联的序列（如建表时用 serial/bigserial 自动关联的序列）。Identity 已在列定义中处理。
-        // 本仓库不少表的主键序列是手工建的（DEFAULT nextval('xxx_id_seq')），没有额外执行
-        // ALTER SEQUENCE ... OWNED BY，pg_get_serial_sequence 会返回 NULL，导致这类新表迁移时
-        // 序列和 DEFAULT 整个丢失。这里兜底直接解析列的 DEFAULT 表达式文本，提取
-        // nextval('xxx'::regclass) 里的序列名，不依赖 ownership。
-        String seqSql = "SELECT a.attname, pg_get_serial_sequence(?, a.attname) AS seq_qualified, "
-                + "pg_get_expr(ad.adbin, ad.adrelid) AS default_expr "
+        // 普通 nextval 默认值通过 pg_attrdef 的依赖定位序列，包括没有 OWNED BY 的序列。
+        // Identity 序列由 identity 列定义创建。
+        String seqSql = "SELECT a.attname, pg_get_expr(ad.adbin, ad.adrelid) AS default_expr, "
+                + "owned.sequence_oid, referenced.refobjid AS default_sequence_oid "
                 + "FROM pg_attribute a "
                 + "JOIN pg_class rel ON rel.oid = a.attrelid "
                 + "JOIN pg_namespace nsp ON nsp.oid = rel.relnamespace "
                 + "LEFT JOIN pg_attrdef ad ON ad.adrelid = a.attrelid AND ad.adnum = a.attnum "
+                + "LEFT JOIN LATERAL (SELECT pg_get_serial_sequence(format('%I.%I', nsp.nspname, rel.relname), "
+                + "a.attname)::regclass::oid AS sequence_oid) owned ON true "
+                + "LEFT JOIN pg_depend referenced ON referenced.classid = 'pg_attrdef'::regclass "
+                + "AND referenced.objid = ad.oid AND referenced.refclassid = 'pg_class'::regclass "
+                + "AND EXISTS (SELECT 1 FROM pg_sequence WHERE seqrelid = referenced.refobjid) "
                 + "WHERE nsp.nspname = ? AND rel.relname = ? AND a.attnum > 0 AND NOT a.attisdropped AND a.attidentity = ''";
         try (PreparedStatement ps = conn.prepareStatement(seqSql)) {
-            ps.setString(1, schema + "." + table);
-            ps.setString(2, schema);
-            ps.setString(3, table);
+            ps.setString(1, schema);
+            ps.setString(2, table);
             try (ResultSet rs = ps.executeQuery()) {
                 while (rs.next()) {
-                    String seqQualified = rs.getString("seq_qualified");
-                    if (seqQualified == null) {
-                        seqQualified = extractSequenceFromDefault(rs.getString("default_expr"));
-                    }
-                    if (seqQualified == null) {
+                    String column = rs.getString("attname");
+                    String ownedOid = rs.getString("sequence_oid");
+                    if (extractSequenceFromDefault(rs.getString("default_expr")) == null) {
                         continue;
                     }
-                    SequenceDef seqDef = fetchSequenceDef(conn, seqQualified);
+                    String sequenceOid = rs.getString("default_sequence_oid");
+                    if (sequenceOid == null) {
+                        sequenceOid = ownedOid;
+                    }
+                    SequenceDef seqDef = sequenceOid == null ? null : fetchSequenceDef(conn, sequenceOid);
                     if (seqDef != null) {
-                        extras.sequenceByColumn.put(rs.getString("attname"), seqDef);
+                        seqDef.ownedByColumn = sequenceOid.equals(ownedOid);
+                        extras.sequenceByColumn.put(column, seqDef);
+                    } else if (logger != null) {
+                        logger.accept("[警告] " + schema + "." + table + "." + column
+                                + " 未找到默认值引用的序列，执行 SQL 前需确认目标库已创建该序列");
                     }
                 }
             }
@@ -353,7 +360,7 @@ public class SchemaDiffService {
     }
 
     private static final java.util.regex.Pattern NEXTVAL_PATTERN =
-            java.util.regex.Pattern.compile("nextval\\('([^']+)'(?:::regclass)?\\)");
+            java.util.regex.Pattern.compile("(?:pg_catalog\\.)?nextval\\('([^']+)'(?:::regclass)?\\)");
 
     /** 从列的 DEFAULT 表达式文本（如 nextval('schema.seq_name'::regclass)）里提取序列名 */
     private static String extractSequenceFromDefault(String defaultExpr) {
@@ -361,25 +368,25 @@ public class SchemaDiffService {
             return null;
         }
         java.util.regex.Matcher m = NEXTVAL_PATTERN.matcher(defaultExpr);
-        return m.find() ? m.group(1) : null;
+        return m.matches() ? m.group(1) : null;
     }
 
-    private SequenceDef fetchSequenceDef(Connection conn, String qualifiedName) throws SQLException {
-        // 两边都转成 regclass 再比较，不用管 pg_get_serial_sequence 返回的名字带不带引号
-        String sql = "SELECT start_value, min_value, max_value, increment_by, cache_size, cycle "
-                + "FROM pg_sequences WHERE (schemaname || '.' || sequencename)::regclass = ?::regclass";
+    private SequenceDef fetchSequenceDef(Connection conn, String sequenceOid) throws SQLException {
+        String sql = "SELECT n.nspname, c.relname, seqstart, seqmin, seqmax, seqincrement, seqcache, seqcycle "
+                + "FROM pg_sequence s JOIN pg_class c ON c.oid = s.seqrelid "
+                + "JOIN pg_namespace n ON n.oid = c.relnamespace WHERE s.seqrelid = ?::oid";
         try (PreparedStatement ps = conn.prepareStatement(sql)) {
-            ps.setString(1, qualifiedName);
+            ps.setString(1, sequenceOid);
             try (ResultSet rs = ps.executeQuery()) {
                 if (rs.next()) {
                     SequenceDef def = new SequenceDef();
-                    def.qualifiedName = qualifiedName;
-                    def.startValue = rs.getLong("start_value");
-                    def.minValue = rs.getLong("min_value");
-                    def.maxValue = rs.getLong("max_value");
-                    def.incrementBy = rs.getLong("increment_by");
-                    def.cacheSize = rs.getLong("cache_size");
-                    def.cycle = rs.getBoolean("cycle");
+                    def.qualifiedName = quoteIdent(rs.getString("nspname")) + "." + quoteIdent(rs.getString("relname"));
+                    def.startValue = rs.getLong("seqstart");
+                    def.minValue = rs.getLong("seqmin");
+                    def.maxValue = rs.getLong("seqmax");
+                    def.incrementBy = rs.getLong("seqincrement");
+                    def.cacheSize = rs.getLong("seqcache");
+                    def.cycle = rs.getBoolean("seqcycle");
                     return def;
                 }
             }
@@ -622,7 +629,7 @@ public class SchemaDiffService {
 
         for (Map.Entry<String, SequenceDef> entry : extras.sequenceByColumn.entrySet()) {
             SequenceDef seq = entry.getValue();
-            sb.append("CREATE SEQUENCE ").append(seq.qualifiedName)
+            sb.append("CREATE SEQUENCE IF NOT EXISTS ").append(seq.qualifiedName)
                     .append(" INCREMENT BY ").append(seq.incrementBy)
                     .append(" MINVALUE ").append(seq.minValue)
                     .append(" MAXVALUE ").append(seq.maxValue)
@@ -642,7 +649,7 @@ public class SchemaDiffService {
             if (info.getIdentityClause() != null) {
                 line.append(info.getIdentityClause());
             } else if (seq != null) {
-                line.append(" DEFAULT nextval('").append(seq.qualifiedName).append("'::regclass)");
+                line.append(" DEFAULT nextval('").append(escapeSqlLiteral(seq.qualifiedName)).append("'::regclass)");
             } else if (info.getDefaultExpression() != null) {
                 line.append(" DEFAULT ").append(info.getDefaultExpression());
             }
@@ -655,6 +662,9 @@ public class SchemaDiffService {
         sb.append("\n);\n");
 
         for (Map.Entry<String, SequenceDef> entry : extras.sequenceByColumn.entrySet()) {
+            if (!entry.getValue().ownedByColumn) {
+                continue;
+            }
             sb.append("ALTER SEQUENCE ").append(entry.getValue().qualifiedName)
                     .append(" OWNED BY ").append(qualifiedTable).append(".").append(quoteIdent(entry.getKey())).append(";\n");
         }
